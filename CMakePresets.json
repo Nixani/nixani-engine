@@ -23,7 +23,8 @@
       "generator": "Ninja",
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
-        "VCPKG_INSTALLED_DIR": "${sourceDir}/vcpkg_installed"
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/vcpkg_installed",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/triplets"
       }
     },
     { "name": "posix-debug",   "inherits": "posix-base", "binaryDir": "${sourceDir}/build/debug",   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },

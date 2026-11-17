@@ -36,7 +36,8 @@ nothing to do.
 
 Needs git, Python 3 with venv, CMake 3.25 or newer, Ninja, pkg-config and a C/C++ compiler
 (`setup.sh` lists the packages for Debian / Ubuntu and for macOS). The libraries are linked in, so
-the program needs nothing but the system itself: glibc on Linux, the system libraries on macOS.
+the program needs nothing but the system itself: glibc on Linux, the system libraries on macOS
+(13 or newer, Apple silicon; `triplets/arm64-osx.cmake` sets that for the libraries too).
 Internet play checks PSN's certificates against `/etc/ssl/certs/ca-certificates.crt` on Linux and
 `/etc/ssl/cert.pem` on macOS.
 
