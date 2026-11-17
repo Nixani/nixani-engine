@@ -16,8 +16,10 @@ Both directions carry a stream of frames, little-endian, no padding:
 | payload | | the fields of that message, in order |
 
 Field types: `u8` `u16` `u32` `u64` `i32` `f32`; `str` = u32 length + UTF-8 bytes; `bytes N` =
-exactly N bytes; `blob` = everything up to the end of the frame. Times are
-`QueryPerformanceCounter` ticks (one clock for both processes).
+exactly N bytes; `blob` = everything up to the end of the frame.
+
+Times come from one clock that both processes read: on Windows `QueryPerformanceCounter` ticks,
+on Linux and macOS `clock_gettime(CLOCK_MONOTONIC)` in nanoseconds.
 
 The engine ends when its input is closed. Standard error is not used.
 

@@ -1,0 +1,4 @@
+#!/bin/sh
+# protoc shim (Linux, macOS): libchiaki only needs protoc to turn takion.proto into a descriptor set.
+# Uses the protoc bundled in grpcio-tools (installed in .venv) instead of a system protobuf.
+exec "$(dirname "$0")/../.venv/bin/python" -m grpc_tools.protoc "$@"

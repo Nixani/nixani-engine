@@ -1,0 +1,80 @@
+name: build
+
+# Builds the engine on Windows, Linux and macOS with the repository's own scripts, runs the tests
+# (tools/smoke_test.py: the whole protocol against the real program, no console needed) and keeps
+# the packed folder of each system as an artifact.
+
+on:
+  push:
+    branches: [main, port-linux-macos]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x64, os: windows-2022 }
+          - { name: linux-x64, os: ubuntu-22.04 }
+          - { name: macos-arm64, os: macos-14 }
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config python3-venv
+
+      - name: Tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja pkg-config
+
+      - name: Cache of built libraries
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ matrix.name }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ matrix.name }}-
+
+      - name: Build and pack (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .vcpkg-cache | Out-Null
+          $env:VCPKG_ROOT = $null   # the runner's own vcpkg is not the one setup.ps1 prepares
+          ./setup.ps1
+          ./package.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and pack (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p .vcpkg-cache
+          unset VCPKG_ROOT   # the runner's own vcpkg is not the one setup.sh prepares
+          ./setup.sh
+          ./package.sh
+
+      - name: Test
+        run: ctest --test-dir build/release --output-on-failure
+
+      - name: What the program needs from the system
+        if: runner.os != 'Windows'
+        run: |
+          file dist/nixani-engine/nixani-engine
+          if [ "$(uname)" = "Darwin" ]; then otool -L dist/nixani-engine/nixani-engine; else ldd dist/nixani-engine/nixani-engine; fi
+          ls -l dist/nixani-engine
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nixani-engine-${{ matrix.name }}
+          path: dist/nixani-engine
+          if-no-files-found: error

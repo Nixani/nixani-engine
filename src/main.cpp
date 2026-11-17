@@ -26,16 +26,37 @@
 #include <chiaki/session.h>
 #include <chiaki/videoreceiver.h>
 
+#ifdef _WIN32
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <Windows.h>
 #include <avrt.h>
 #include <iphlpapi.h>
+#else
+#include <arpa/inet.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+#include <signal.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -53,9 +74,165 @@ using nxe::Reader;
 using nxe::Writer;
 
 // ------------------------------------------------------------------------------------------------
+// The few things Windows and the other systems (Linux, macOS) do differently: the two pipes, the
+// clock, thread priority and names. Everything below this block is the same everywhere.
+
+#ifdef _WIN32
+
+HANDLE gIn = INVALID_HANDLE_VALUE, gOut = INVALID_HANDLE_VALUE;
+
+// Takes over the standard input and output. Whatever a library prints with printf afterwards goes
+// nowhere instead of into the message stream.
+bool OpenPipes()
+{
+	gIn = GetStdHandle(STD_INPUT_HANDLE);
+	if(!DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_OUTPUT_HANDLE), GetCurrentProcess(), &gOut, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+	   gIn == nullptr || gIn == INVALID_HANDLE_VALUE)
+		return false;
+	FILE *nul = nullptr;
+	freopen_s(&nul, "NUL", "w", stdout);
+	return true;
+}
+
+// Bytes read (0 = the client closed the pipe).
+size_t ReadSome(uint8_t *data, size_t size)
+{
+	DWORD n = 0;
+	return ReadFile(gIn, data, static_cast<DWORD>(size), &n, nullptr) ? n : 0;
+}
+
+bool WriteAll(const uint8_t *data, size_t size)
+{
+	size_t done = 0;
+	while(done < size)
+	{
+		DWORD n = 0;
+		if(!WriteFile(gOut, data + done, static_cast<DWORD>(size - done), &n, nullptr) || n == 0)
+			return false;
+		done += n;
+	}
+	return true;
+}
+
+[[noreturn]] void Quit()
+{
+	ExitProcess(0);
+}
+
+// The protocol's clock (see PROTOCOL.md): QueryPerformanceCounter ticks.
+int64_t Now()
+{
+	LARGE_INTEGER v;
+	QueryPerformanceCounter(&v);
+	return v.QuadPart;
+}
+
+// The receive thread carries the video and audio to the client: give it MMCSS "Games" scheduling.
+void RaiseThreadPriority()
+{
+	DWORD task = 0;
+	AvSetMmThreadCharacteristicsW(L"Games", &task);
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+}
+
+void NameThread(const char *name)
+{
+	wchar_t wide[32] = {};
+	for(size_t i = 0; i + 1 < std::size(wide) && name[i]; ++i)
+		wide[i] = static_cast<wchar_t>(name[i]);
+	SetThreadDescription(GetCurrentThread(), wide);
+}
+
+#else
+
+int gOut = -1;
+
+bool OpenPipes()
+{
+	signal(SIGPIPE, SIG_IGN); // a client that went away shows up as a failed write, not as a signal
+	gOut = dup(STDOUT_FILENO);
+	if(gOut < 0)
+		return false;
+	const int nul = open("/dev/null", O_WRONLY);
+	if(nul >= 0)
+	{
+		dup2(nul, STDOUT_FILENO);
+		close(nul);
+	}
+	return true;
+}
+
+size_t ReadSome(uint8_t *data, size_t size)
+{
+	for(;;)
+	{
+		const ssize_t n = read(STDIN_FILENO, data, size);
+		if(n >= 0)
+			return static_cast<size_t>(n);
+		if(errno != EINTR)
+			return 0;
+	}
+}
+
+bool WriteAll(const uint8_t *data, size_t size)
+{
+	size_t done = 0;
+	while(done < size)
+	{
+		const ssize_t n = write(gOut, data + done, size - done);
+		if(n > 0)
+			done += static_cast<size_t>(n);
+		else if(n == 0 || errno != EINTR)
+			return false;
+	}
+	return true;
+}
+
+[[noreturn]] void Quit()
+{
+	_exit(0);
+}
+
+// The protocol's clock (see PROTOCOL.md): CLOCK_MONOTONIC in nanoseconds.
+int64_t Now()
+{
+	timespec ts{};
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
+}
+
+void RaiseThreadPriority()
+{
+#ifdef __APPLE__
+	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+	// Linux: a higher priority needs privileges an ordinary program does not have. The default is fine.
+}
+
+void NameThread(const char *name)
+{
+#ifdef __APPLE__
+	pthread_setname_np(name);
+#else
+	pthread_setname_np(pthread_self(), name); // at most 15 characters
+#endif
+}
+
+#endif
+
+// Once per thread.
+void BoostCurrentThread()
+{
+	thread_local bool boosted = false;
+	if(boosted)
+		return;
+	boosted = true;
+	RaiseThreadPriority();
+}
+
+// ------------------------------------------------------------------------------------------------
 // Output: every thread sends whole frames through here.
 
-HANDLE gOut = INVALID_HANDLE_VALUE;
 std::mutex gOutMutex;
 ChiakiLog gLog{};
 
@@ -63,14 +240,8 @@ void Send(Writer &w)
 {
 	const std::vector<uint8_t> &frame = w.frame();
 	std::lock_guard lock(gOutMutex);
-	size_t done = 0;
-	while(done < frame.size())
-	{
-		DWORD n = 0;
-		if(!WriteFile(gOut, frame.data() + done, static_cast<DWORD>(frame.size() - done), &n, nullptr) || n == 0)
-			ExitProcess(0); // the client is gone
-		done += n;
-	}
+	if(!WriteAll(frame.data(), frame.size()))
+		Quit(); // the client is gone
 }
 
 void Send(Msg type)
@@ -101,26 +272,6 @@ void OnChiakiLog(ChiakiLogLevel level, const char *msg, void *)
 	Send(w);
 }
 
-int64_t Qpc()
-{
-	LARGE_INTEGER v;
-	QueryPerformanceCounter(&v);
-	return v.QuadPart;
-}
-
-// The receive thread carries the video and audio to the client: give it MMCSS "Games" scheduling
-// (once per thread).
-void BoostCurrentThread()
-{
-	thread_local bool boosted = false;
-	if(boosted)
-		return;
-	boosted = true;
-	DWORD task = 0;
-	AvSetMmThreadCharacteristicsW(L"Games", &task);
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-}
-
 // ------------------------------------------------------------------------------------------------
 // Discovery and wake-up
 
@@ -131,6 +282,28 @@ bool gDiscoveryRunning = false;
 std::vector<sockaddr_storage> SubnetBroadcasts()
 {
 	std::vector<sockaddr_storage> out;
+#ifndef _WIN32
+	ifaddrs *list = nullptr;
+	if(getifaddrs(&list) != 0)
+		return out;
+	for(ifaddrs *a = list; a; a = a->ifa_next)
+	{
+		if(!a->ifa_addr || a->ifa_addr->sa_family != AF_INET || !a->ifa_netmask)
+			continue;
+		if(!(a->ifa_flags & IFF_UP) || !(a->ifa_flags & IFF_BROADCAST) || (a->ifa_flags & IFF_LOOPBACK))
+			continue;
+		const in_addr addr = reinterpret_cast<const sockaddr_in *>(a->ifa_addr)->sin_addr;
+		const in_addr mask = reinterpret_cast<const sockaddr_in *>(a->ifa_netmask)->sin_addr;
+		if(addr.s_addr == 0)
+			continue;
+		sockaddr_storage ss{};
+		auto *sin = reinterpret_cast<sockaddr_in *>(&ss);
+		sin->sin_family = AF_INET;
+		sin->sin_addr.s_addr = addr.s_addr | ~mask.s_addr;
+		out.push_back(ss);
+	}
+	freeifaddrs(list);
+#else
 	ULONG size = 0;
 	if(GetAdaptersInfo(nullptr, &size) != ERROR_BUFFER_OVERFLOW)
 		return out;
@@ -154,6 +327,7 @@ std::vector<sockaddr_storage> SubnetBroadcasts()
 			out.push_back(ss);
 		}
 	}
+#endif
 	return out;
 }
 
@@ -383,7 +557,7 @@ std::unique_ptr<Session> gSession;
 
 bool OnVideoSample(uint8_t *buf, size_t size, int32_t framesLost, bool recovered, void *)
 {
-	const int64_t received = Qpc();
+	const int64_t received = Now();
 	BoostCurrentThread();
 	Writer w(Msg::Video);
 	w.u64(static_cast<uint64_t>(received)).i32(framesLost).u8(recovered ? 1 : 0).raw(buf, size);
@@ -490,7 +664,7 @@ void OnEvent(ChiakiEvent *event, void *user)
 
 void RunPsnConnect(Session *s)
 {
-	SetThreadDescription(GetCurrentThread(), L"PSN connect");
+	NameThread("PSN connect");
 	const ChiakiHolepunchConsoleType type = s->session.target >= CHIAKI_TARGET_PS5_UNKNOWN ? CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS5 : CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS4;
 	auto fail = [&](const char *what, ChiakiErrorCode err) {
 		if(s->psnCancel.load())
@@ -663,7 +837,7 @@ void SessionStart(Reader &r)
 		int ticks = 0;
 		while(!s->statsStop.load())
 		{
-			Sleep(50);
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			if(++ticks < 20)
 				continue;
 			ticks = 0;
@@ -774,7 +948,7 @@ void Dispatch(Msg type, Reader &r)
 			const uint32_t echo = std::min<uint32_t>(r.u32(), 4u * 1024 * 1024);
 			const std::vector<uint8_t> zeros(echo);
 			Writer w(Msg::Pong);
-			w.u64(clientTime).u64(static_cast<uint64_t>(Qpc())).raw(zeros.data(), zeros.size());
+			w.u64(clientTime).u64(static_cast<uint64_t>(Now())).raw(zeros.data(), zeros.size());
 			Send(w);
 			break;
 		}
@@ -792,17 +966,12 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	// The protocol owns the real standard output. Anything a library prints with printf goes nowhere
-	// instead of into the message stream.
-	const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
-	if(!DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_OUTPUT_HANDLE), GetCurrentProcess(), &gOut, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
-	   in == nullptr || in == INVALID_HANDLE_VALUE)
+	// The protocol owns the real standard output.
+	if(!OpenPipes())
 	{
 		std::fprintf(stderr, "nixani-engine is started by a client program and talks to it over stdin/stdout (see PROTOCOL.md).\n");
 		return 2;
 	}
-	FILE *nul = nullptr;
-	freopen_s(&nul, "NUL", "w", stdout);
 
 	chiaki_log_init(&gLog, CHIAKI_LOG_ALL & ~(CHIAKI_LOG_VERBOSE | CHIAKI_LOG_DEBUG), &OnChiakiLog, nullptr);
 	const ChiakiErrorCode err = chiaki_lib_init();
@@ -811,16 +980,21 @@ int main(int argc, char **argv)
 		Log(kError, "libchiaki init failed: %s", chiaki_error_string(err));
 		return 1;
 	}
+#ifndef _WIN32
+	// Internet play checks PSN's certificates against the system's list of trusted authorities.
+	if(access(NXE_CA_BUNDLE, R_OK) != 0)
+		Log(kWarning, "No certificate bundle at %s: internet play (PSN) will not connect on this system", NXE_CA_BUNDLE);
+#endif
 
 	// Commands, one frame after another, until the client closes the pipe.
 	std::vector<uint8_t> buf;
 	std::vector<uint8_t> chunk(64 * 1024);
 	for(;;)
 	{
-		DWORD n = 0;
-		if(!ReadFile(in, chunk.data(), static_cast<DWORD>(chunk.size()), &n, nullptr) || n == 0)
+		const size_t n = ReadSome(chunk.data(), chunk.size());
+		if(n == 0)
 			break;
-		buf.insert(buf.end(), chunk.begin(), chunk.begin() + n);
+		buf.insert(buf.end(), chunk.begin(), chunk.begin() + static_cast<ptrdiff_t>(n));
 		size_t pos = 0;
 		while(buf.size() - pos >= 6)
 		{

@@ -1,6 +1,6 @@
 # Nixani Engine
 
-A Remote Play engine for PS4 and PS5 consoles on Windows: one small program without a window
+A Remote Play engine for PS4 and PS5 consoles on Windows, Linux and macOS: one small program without a window
 that finds consoles, links with them, wakes them and runs the Remote Play connection, on the
 local network or over the internet through PSN.
 
@@ -25,6 +25,31 @@ vcpkg into the folder.
 
 `nixani-engine.exe --version` prints the version; started without a client on its pipes it has
 nothing to do.
+
+## Build (Linux, macOS)
+
+```sh
+./setup.sh     # once: submodules, Python venv for code generation, vcpkg
+./build.sh     # build/release/nixani-engine
+./package.sh   # dist/nixani-engine: the program with the licence texts
+```
+
+Needs git, Python 3 with venv, CMake 3.25 or newer, Ninja, pkg-config and a C/C++ compiler
+(`setup.sh` lists the packages for Debian / Ubuntu and for macOS). The libraries are linked in, so
+the program needs nothing but the system itself: glibc on Linux, the system libraries on macOS.
+Internet play checks PSN's certificates against `/etc/ssl/certs/ca-certificates.crt` on Linux and
+`/etc/ssl/cert.pem` on macOS.
+
+## Tests
+
+```sh
+ctest --test-dir build/release --output-on-failure
+```
+
+`tools/smoke_test.py` starts the built program and talks to it like a client: handshake, the
+shared clock, discovery, a wake packet, sessions and linking against an address where no console
+answers, and a clean exit. It needs no console and no PSN account. Every push is built and tested
+this way on Windows, Linux and macOS (`.github/workflows/build.yml`).
 
 ## Licence
 

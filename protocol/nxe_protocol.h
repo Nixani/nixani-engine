@@ -87,7 +87,8 @@ enum class SessionPhase : uint8_t {
 	Ended = 3,      // text = why; isError tells a failure from a normal end
 };
 
-// Times are QueryPerformanceCounter ticks: the same clock in both processes.
+// Times come from one clock that both processes read: QueryPerformanceCounter ticks on Windows,
+// clock_gettime(CLOCK_MONOTONIC) in nanoseconds on Linux and macOS.
 
 // Controller buttons (PadState.buttons).
 enum PadButton : uint32_t {
