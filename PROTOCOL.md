@@ -1,4 +1,4 @@
-# Nixani Engine protocol (version 1)
+# Nixani Engine protocol (version 2)
 
 The engine is a program without a window. A client program starts it and talks to it through the
 engine's standard input and standard output. Any program in any language can be a client; the
@@ -38,6 +38,8 @@ The engine ends when its input is closed. Standard error is not used.
 | 42 | Pad | PadState (below) | one controller state; each message is one update to the console |
 | 43 | LoginPin | str pin | the console's login PIN, after LoginPinRequest |
 | 44 | RequestKeyframe | | asks the console for a fresh picture (after a frame could not be decoded) |
+| 45 | Mic | u8 live | 1 opens the microphone (the first time also connects it to the console), 0 mutes it. Only during a stream. New in version 2 |
+| 46 | MicAudio | blob: 48 kHz stereo signed 16-bit samples | the microphone's sound, in whole 10 ms frames (480 samples per channel). Dropped while muted. New in version 2 |
 | 50 | Ping | u64 clientTime, u32 echoBytes | answered with Pong |
 
 **SessionParams**: str host, u8 ps5, bytes 16 registKey, bytes 16 rpKey, bytes 8 accountId,
@@ -88,5 +90,9 @@ triangle, L1, R1, L3, R3, share, options, touchpad, PS.
    `Audio` and the feedback messages arrive, and every `Pad` message is sent to the console.
 5. `SessionStop`, wait for `SessionStopped`. A session that ended by itself (`SessionState` 3)
    is stopped the same way before the next one starts.
+
+A microphone is optional: once the stream runs, `Mic` 1 opens it and `MicAudio` carries its sound
+(48 kHz, stereo, 16-bit, 10 ms at a time); the engine encodes it and sends it to the console, where
+it is the player's voice in party and game chat. `Mic` 0 mutes it.
 
 The engine decodes no video and opens no audio device or controller: that is the client's part.

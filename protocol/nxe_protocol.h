@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// Nixani Engine protocol, version 1.
+// Nixani Engine protocol, version 2.
 //
 // Copyright (c) 2026 Nixani
 //
@@ -34,7 +34,7 @@
 
 namespace nxe {
 
-constexpr uint32_t kProtocolVersion = 1;
+constexpr uint32_t kProtocolVersion = 2; // 2: Mic and MicAudio
 constexpr uint32_t kMaxFrame = 16u * 1024 * 1024; // a frame larger than this is a broken stream
 
 enum class Msg : uint16_t {
@@ -52,6 +52,8 @@ enum class Msg : uint16_t {
 	Pad = 42,            // see PadState
 	LoginPin = 43,       // str pin
 	RequestKeyframe = 44, // (none)
+	Mic = 45,            // u8 live: 1 = the microphone is open, 0 = muted. The first "open" connects it to the console.
+	MicAudio = 46,       // blob: 48 kHz stereo signed 16-bit samples, a whole number of 480-sample (10 ms) frames
 	Ping = 50,           // u64 clientTime, u32 echoBytes      -> Pong
 
 	// ---- engine -> client ----

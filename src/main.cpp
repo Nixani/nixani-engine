@@ -20,6 +20,7 @@
 #include <chiaki/discoveryservice.h>
 #include <chiaki/log.h>
 #include <chiaki/opusdecoder.h>
+#include <chiaki/opusencoder.h>
 #include <chiaki/orientation.h>
 #include <chiaki/regist.h>
 #include <chiaki/remote/holepunch.h>
@@ -358,10 +359,15 @@ void SendState(nxe::SessionPhase phase, bool isError, const std::string &text)
 	Send(w);
 }
 
+constexpr unsigned kMicRate = 48000, kMicFrame = 480; // what the console takes: 48 kHz, 10 ms at a time
+
 struct Session {
 	ChiakiSession session{};
 	ChiakiOpusDecoder opus{};
 	bool init = false, started = false, opusInit = false;
+	// The player's microphone, when the client sends one: encoded here and sent to the console.
+	ChiakiOpusEncoder mic{};
+	bool micInit = false, micConnected = false, micLive = false;
 	std::atomic<bool> streaming{false};
 
 	// Internet play: the PSN handshake runs on its own thread, then starts the session.
@@ -559,6 +565,8 @@ void SessionStop(bool announce)
 		chiaki_session_fini(&s->session); // also ends the PSN session (internet play)
 	if(s->opusInit)
 		chiaki_opus_decoder_fini(&s->opus);
+	if(s->micInit)
+		chiaki_opus_encoder_fini(&s->mic);
 	gSession.reset();
 	if(announce)
 		Send(Msg::SessionStopped);
@@ -625,6 +633,12 @@ void SessionStart(Reader &r)
 	chiaki_opus_decoder_get_sink(&s->opus, &sink);
 	chiaki_session_set_audio_sink(&s->session, &sink);
 	chiaki_session_set_video_sample_cb(&s->session, &OnVideoSample, s);
+	// Ready for a microphone (48 kHz stereo, 10 ms frames). Nothing is sent unless the client opens it.
+	chiaki_opus_encoder_init(&s->mic, &gLog);
+	s->micInit = true;
+	ChiakiAudioHeader micHeader{};
+	chiaki_audio_header_set(&micHeader, 2, 16, kMicRate, kMicFrame);
+	chiaki_opus_encoder_header(&micHeader, &s->mic, &s->session);
 	ChiakiAudioSink haptics{};
 	haptics.user = s;
 	haptics.frame_cb = &OnHapticsFrame;
@@ -653,6 +667,7 @@ void SessionStart(Reader &r)
 		{
 			chiaki_session_fini(&s->session);
 			chiaki_opus_decoder_fini(&s->opus);
+			chiaki_opus_encoder_fini(&s->mic);
 			return fail(std::string("could not start session: ") + chiaki_error_string(err));
 		}
 		s->started = true;
@@ -727,6 +742,40 @@ void Pad(Reader &r)
 	chiaki_session_set_controller_state(&s->session, &cs);
 }
 
+// The microphone: the first "open" tells the console a microphone is there, after that it is
+// opened and muted. (libchiaki's call takes "is muted now": true opens it.)
+void Mic(Reader &r)
+{
+	Session *s = gSession.get();
+	const bool live = r.u8() != 0;
+	if(!s || !r.ok() || !s->streaming.load())
+		return;
+	if(live && !s->micConnected)
+	{
+		if(chiaki_session_connect_microphone(&s->session) != CHIAKI_ERR_SUCCESS)
+			return Log(kWarning, "The console did not take the microphone");
+		s->micConnected = true;
+		Log(kInfo, "Microphone connected");
+	}
+	if(!s->micConnected)
+		return;
+	chiaki_session_toggle_microphone(&s->session, live);
+	s->micLive = live;
+}
+
+void MicAudio(Reader &r)
+{
+	Session *s = gSession.get();
+	if(!s || !s->streaming.load() || !s->micLive)
+		return;
+	int16_t frame[kMicFrame * 2]; // the message bytes are not aligned for int16
+	while(r.left() >= sizeof(frame))
+	{
+		r.raw(frame, sizeof(frame));
+		chiaki_opus_encoder_frame(frame, &s->mic);
+	}
+}
+
 // ------------------------------------------------------------------------------------------------
 
 void Dispatch(Msg type, Reader &r)
@@ -756,6 +805,8 @@ void Dispatch(Msg type, Reader &r)
 		case Msg::SessionStart: SessionStart(r); break;
 		case Msg::SessionStop: SessionStop(true); break;
 		case Msg::Pad: Pad(r); break;
+		case Msg::Mic: Mic(r); break;
+		case Msg::MicAudio: MicAudio(r); break;
 		case Msg::LoginPin: {
 			const std::string pin = r.str();
 			if(gSession && gSession->init)

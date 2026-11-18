@@ -1,6 +1,6 @@
 {
   "name": "nixani-engine",
-  "version-string": "1.0.0",
+  "version-string": "1.1.0",
   "description": "Remote Play engine for PS4 / PS5 consoles: libchiaki behind a simple message protocol",
   "dependencies": [ "pkgconf", "openssl", "json-c", "libevent", "miniupnpc", "opus" ]
 }
