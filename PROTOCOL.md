@@ -1,4 +1,4 @@
-# Nixani Engine protocol (version 2)
+# Nixani Engine protocol (version 3)
 
 The engine is a program without a window. A client program starts it and talks to it through the
 engine's standard input and standard output. Any program in any language can be a client; the
@@ -30,7 +30,8 @@ The engine ends when its input is closed. Standard error is not used.
 | 11 | DiscoveryStop | | |
 | 12 | Wake | str address, bytes 16 registKey, u8 ps5 | wakes a console from rest mode |
 | 20 | RegistStart | str address, u32 target, bytes 8 accountId, u32 linkCode, u32 consolePin | links with a console; answered with RegistResult |
-| 21 | RegistCancel | | |
+| 21 | RegistCancel | | also ends a RegistPsn, finished or not |
+| 22 | RegistPsn | str psnToken, bytes 32 consoleUid, u8 ps5, bytes 8 accountId | links with a console through PSN: no code and no shared network, the console only has to be signed in to that account with Remote Play enabled. consoleUid is the uid from DevicesResult. Answered with RegistProgress messages and one RegistResult. New in version 3 |
 | 30 | ListDevices | u32 requestId, str psnToken | consoles on a PSN account; answered with DevicesResult |
 | 31 | NewDeviceUid | u32 requestId | a new client device id for the PSN sign-in; answered with DeviceUid |
 | 40 | SessionStart | SessionParams (below) | starts a stream; progress arrives as SessionState |
@@ -62,6 +63,7 @@ triangle, L1, R1, L3, R3, share, options, touchpad, PS.
 | 102 | Log | u8 level (0 error, 1 warning, 2 info, 3 debug), str text |
 | 110 | Hosts | u32 count, then per console: u8 state (0 unknown, 1 on, 2 rest mode), str name, str address, str hostId, str systemVersion, str runningApp, u8 ps5, u32 target |
 | 120 | RegistResult | u8 ok, str error; if ok: str nickname, bytes 6 mac, u32 target, bytes 16 registKey, bytes 16 rpKey, u32 rpKeyType, u32 consolePin |
+| 121 | RegistProgress | str text: what RegistPsn is doing right now. New in version 3 |
 | 130 | DevicesResult | u32 requestId, str error, u32 count, then per device: str name, bytes 32 uid, u8 ps5, u8 remotePlayEnabled |
 | 131 | DeviceUid | u32 requestId, str uid |
 | 140 | SessionState | u8 state (1 connecting, 2 streaming, 3 ended), u8 isError, str text |
@@ -85,7 +87,7 @@ triangle, L1, R1, L3, R3, share, options, touchpad, PS.
 2. `DiscoveryStart`; pick a console from `Hosts`. If it is in rest mode, `Wake` it and wait until
    `Hosts` shows it on.
 3. Once per console: `RegistStart` with the 8-digit code the console shows; keep the keys from
-   `RegistResult`.
+   `RegistResult`. Or, without the code: `ListDevices`, then `RegistPsn` with that console's uid.
 4. `SessionStart`. `SessionState` reports connecting, then streaming. From then on `Video`,
    `Audio` and the feedback messages arrive, and every `Pad` message is sent to the console.
 5. `SessionStop`, wait for `SessionStopped`. A session that ended by itself (`SessionState` 3)

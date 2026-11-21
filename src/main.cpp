@@ -352,8 +352,32 @@ void NewDeviceUid(uint32_t requestId)
 // ------------------------------------------------------------------------------------------------
 // The Remote Play session
 
+// RegistPsn runs as a session that ends once the console has handed over its keys: what such a
+// session reports goes out as registration messages instead of session ones.
+std::atomic<bool> gPsnRegist{false}, gPsnRegistDone{false};
+
 void SendState(nxe::SessionPhase phase, bool isError, const std::string &text)
 {
+	if(gPsnRegist.load())
+	{
+		if(phase == nxe::SessionPhase::Connecting && !text.empty())
+		{
+			Writer w(Msg::RegistProgress);
+			w.str(text == "Starting the stream..." ? "Asking the console for its keys..." : text);
+			Send(w);
+		}
+		else if(phase == nxe::SessionPhase::Ended && !gPsnRegistDone.exchange(true))
+		{
+			// The same steps as internet play fail with its wording: say what it means for linking.
+			static const std::string internet = "internet connection failed";
+			std::string why = text.empty() ? "the console did not answer" : text;
+			if(why.rfind(internet, 0) == 0)
+				why = "the console could not be reached through PlayStation Network" + why.substr(internet.size()) +
+				      ". It has to be on (or in rest mode with its internet connection kept), signed in to this account, with Remote Play enabled";
+			SendRegistFailure(why.c_str());
+		}
+		return;
+	}
 	Writer w(Msg::SessionState);
 	w.u8(static_cast<uint8_t>(phase)).u8(isError ? 1 : 0).str(text);
 	Send(w);
@@ -437,6 +461,16 @@ void OnEvent(ChiakiEvent *event, void *user)
 		case CHIAKI_EVENT_CONNECTED:
 			self->streaming = true;
 			SendState(nxe::SessionPhase::Streaming, false, {});
+			break;
+		case CHIAKI_EVENT_REGIST:
+			if(gPsnRegist.load() && !gPsnRegistDone.exchange(true))
+			{
+				const ChiakiRegisteredHost &h = event->host;
+				Writer w(Msg::RegistResult);
+				w.u8(1).str("").str(h.server_nickname).raw(h.server_mac, 6).u32(static_cast<uint32_t>(h.target));
+				w.raw(h.rp_regist_key, 16).raw(h.rp_key, 16).u32(h.rp_key_type).u32(h.console_pin);
+				Send(w);
+			}
 			break;
 		case CHIAKI_EVENT_LOGIN_PIN_REQUEST: {
 			Writer w(Msg::LoginPinRequest);
@@ -572,13 +606,9 @@ void SessionStop(bool announce)
 		Send(Msg::SessionStopped);
 }
 
-void SessionStart(Reader &r)
+// autoRegist: the session only fetches the console's keys through PSN and ends (RegistPsn).
+void StartSession(const nxe::SessionParams &p, bool autoRegist)
 {
-	SessionStop(false);
-	const nxe::SessionParams p = nxe::ReadSessionParams(r);
-	if(!r.ok())
-		return SendState(nxe::SessionPhase::Ended, true, "bad session request");
-
 	gSession = std::make_unique<Session>();
 	Session *s = gSession.get();
 	std::memcpy(s->deviceUid, p.deviceUid, sizeof(s->deviceUid));
@@ -602,7 +632,7 @@ void SessionStart(Reader &r)
 	ci.enable_keyboard = false;
 	ci.enable_dualsense = p.dualsense;
 	ci.audio_video_disabled = CHIAKI_NONE_DISABLED;
-	ci.auto_regist = false;
+	ci.auto_regist = autoRegist;
 	ci.packet_loss_max = 0.05;
 	ci.enable_idr_on_fec_failure = true; // ask for a recovery frame immediately instead of waiting
 
@@ -684,13 +714,47 @@ void SessionStart(Reader &r)
 			ticks = 0;
 			if(!s->streaming.load())
 				continue;
+			// Read only: these counters are what libchiaki's reports to the console are made from (it
+			// resets them itself, five times a second), so the numbers here are a sample of that window.
 			uint64_t received = 0, lost = 0;
-			chiaki_packet_stats_get(&s->session.stream_connection.packet_stats, true, &received, &lost);
+			chiaki_packet_stats_get(&s->session.stream_connection.packet_stats, false, &received, &lost);
 			Writer w(Msg::Stats);
 			w.u64(received).u64(lost).u32(static_cast<uint32_t>(s->session.rtt_us)).u64(s->fecFailures.load()).u64(s->keyframeRequests.load());
 			Send(w);
 		}
 	});
+}
+
+void SessionStart(Reader &r)
+{
+	SessionStop(false);
+	gPsnRegist = false;
+	const nxe::SessionParams p = nxe::ReadSessionParams(r);
+	if(!r.ok())
+		return SendState(nxe::SessionPhase::Ended, true, "bad session request");
+	StartSession(p, false);
+}
+
+// Linking with a console through PSN: the same PSN handshake as internet play, after which the
+// console hands over its keys without asking for a code (it trusts the PSN account it is signed in to).
+void RegistPsn(Reader &r)
+{
+	RegistReset();
+	SessionStop(false);
+	nxe::SessionParams p;
+	p.psnToken = r.str();
+	r.raw(p.deviceUid, sizeof(p.deviceUid));
+	p.ps5 = r.u8() != 0;
+	r.raw(p.accountId, sizeof(p.accountId));
+	if(!r.ok() || p.psnToken.empty())
+		return SendRegistFailure("bad request");
+	p.internet = true;
+	p.dualsense = false;
+	p.resolution = 720;
+	gPsnRegistDone = false;
+	gPsnRegist = true;
+	Log(kInfo, "Linking with a %s through PSN", p.ps5 ? "PS5" : "PS4");
+	StartSession(p, true);
 }
 
 uint32_t ToChiakiButtons(uint32_t b)
@@ -795,7 +859,16 @@ void Dispatch(Msg type, Reader &r)
 		case Msg::DiscoveryStop: DiscoveryStop(); break;
 		case Msg::Wake: Wake(r); break;
 		case Msg::RegistStart: RegistStart(r); break;
-		case Msg::RegistCancel: RegistReset(); break;
+		case Msg::RegistPsn: RegistPsn(r); break;
+		case Msg::RegistCancel:
+			RegistReset();
+			if(gPsnRegist.load()) // also how the client says "thank you" after a RegistResult
+			{
+				gPsnRegistDone = true; // nothing more to report about it
+				SessionStop(false);
+				gPsnRegist = false;
+			}
+			break;
 		case Msg::ListDevices: {
 			const uint32_t id = r.u32();
 			ListDevices(id, r.str());

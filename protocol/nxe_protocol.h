@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// Nixani Engine protocol, version 2.
+// Nixani Engine protocol, version 3.
 //
 // Copyright (c) 2026 Nixani
 //
@@ -34,7 +34,7 @@
 
 namespace nxe {
 
-constexpr uint32_t kProtocolVersion = 2; // 2: Mic and MicAudio
+constexpr uint32_t kProtocolVersion = 3; // 2: Mic and MicAudio. 3: RegistPsn and RegistProgress
 constexpr uint32_t kMaxFrame = 16u * 1024 * 1024; // a frame larger than this is a broken stream
 
 enum class Msg : uint16_t {
@@ -45,6 +45,8 @@ enum class Msg : uint16_t {
 	Wake = 12,           // str address, bytes 16 registKey, u8 ps5
 	RegistStart = 20,    // str address, u32 target, bytes 8 accountId, u32 linkCode, u32 consolePin
 	RegistCancel = 21,   // (none)
+	RegistPsn = 22,      // str psnToken, bytes 32 consoleUid (from DevicesResult), u8 ps5, bytes 8 accountId
+	                     //   links with a console through PSN: no code, no shared network -> RegistProgress, RegistResult
 	ListDevices = 30,    // u32 requestId, str psnToken        -> DevicesResult
 	NewDeviceUid = 31,   // u32 requestId                      -> DeviceUid
 	SessionStart = 40,   // see SessionParams
@@ -63,6 +65,7 @@ enum class Msg : uint16_t {
 	                      //   str hostId, str systemVersion, str runningApp, u8 ps5, u32 target
 	RegistResult = 120,   // u8 ok, str error, then if ok: str nickname, bytes 6 mac, u32 target, bytes 16 registKey,
 	                      //   bytes 16 rpKey, u32 rpKeyType, u32 consolePin
+	RegistProgress = 121, // str text: what RegistPsn is doing right now
 	DevicesResult = 130,  // u32 requestId, str error, u32 count, then per device: str name, bytes 32 uid, u8 ps5, u8 remotePlayEnabled
 	DeviceUid = 131,      // u32 requestId, str uid
 	SessionState = 140,   // u8 state (SessionPhase), u8 isError, str text
